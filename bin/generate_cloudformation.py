@@ -4,6 +4,7 @@ import subprocess
 import os
 import re
 
+
 def b64text(txt):
     """Generate Base 64 encoded CF json for a multiline string, subbing in values where appropriate"""
     lines = []
@@ -21,14 +22,8 @@ version = subprocess.check_output(f"{path}/version").decode("ascii").strip()
 with open(f"{path}/templates/docker-compose.yml") as f:
     docker_compose_file = str(f.read())
 
-with open(f"{path}/../config/backup_disk.xml") as f:
-    backup_disk_config = str(f.read())
 
-with open(f"{path}/../config/chroma_users.xml") as f:
-    chroma_users_config = str(f.read())
-
-
-cloud_config_script = f"""
+cloud_config_script = """
 #cloud-config
 cloud_final_modules:
 - [scripts-user, always]
@@ -49,14 +44,6 @@ cat << EOF > /home/ec2-user/docker-compose.yml
 EOF
 
 mkdir /home/ec2-user/config
-
-cat << EOF > /home/ec2-user/config/backup_disk.xml
-{backup_disk_config}
-EOF
-
-cat << EOF > /home/ec2-user/config/chroma_users.xml
-{chroma_users_config}
-EOF
 
 docker-compose -f /home/ec2-user/docker-compose.yml up -d
 """
@@ -110,15 +97,27 @@ cf = {
         "ChromaInstance": {
             "Type": "AWS::EC2::Instance",
             "Properties": {
-                "ImageId": {"Fn::FindInMap": ["Region2AMI", {"Ref": "AWS::Region"}, "AMI"]},
+                "ImageId": {
+                    "Fn::FindInMap": ["Region2AMI", {"Ref": "AWS::Region"}, "AMI"]
+                },
                 "InstanceType": {"Ref": "InstanceType"},
                 "UserData": b64text(userdata),
                 "SecurityGroupIds": [{"Ref": "ChromaInstanceSecurityGroup"}],
-                "KeyName": {"Fn::If": ["HasKeyName", {"Ref": "KeyName"}, {"Ref": "AWS::NoValue"}]},
+                "KeyName": {
+                    "Fn::If": [
+                        "HasKeyName",
+                        {"Ref": "KeyName"},
+                        {"Ref": "AWS::NoValue"},
+                    ]
+                },
                 "BlockDeviceMappings": [
                     {
                         "DeviceName": {
-                            "Fn::FindInMap": ["Region2AMI", {"Ref": "AWS::Region"}, "RootDeviceName"]
+                            "Fn::FindInMap": [
+                                "Region2AMI",
+                                {"Ref": "AWS::Region"},
+                                "RootDeviceName",
+                            ]
                         },
                         "Ebs": {"VolumeSize": 24},
                     }
@@ -130,7 +129,12 @@ cf = {
             "Properties": {
                 "GroupDescription": "Chroma Instance Security Group",
                 "SecurityGroupIngress": [
-                    {"IpProtocol": "tcp", "FromPort": "22", "ToPort": "22", "CidrIp": "0.0.0.0/0"},
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "22",
+                        "ToPort": "22",
+                        "CidrIp": "0.0.0.0/0",
+                    },
                     {
                         "IpProtocol": "tcp",
                         "FromPort": "8000",
@@ -165,7 +169,10 @@ for region in regions:
     img = ami_result["Images"][0]
     ami_id = img["ImageId"]
     root_device_name = img["BlockDeviceMappings"][0]["DeviceName"]
-    cf["Mappings"]["Region2AMI"][region_name] = {"AMI": ami_id, "RootDeviceName": root_device_name}
+    cf["Mappings"]["Region2AMI"][region_name] = {
+        "AMI": ami_id,
+        "RootDeviceName": root_device_name,
+    }
 
 
 # Write the CF json to a file
@@ -174,15 +181,18 @@ json.dump(cf, open("/tmp/chroma.cf.json", "w"), indent=4)
 # upload to S3
 s3 = boto3.client("s3", region_name="us-east-1")
 s3.upload_file(
-    "/tmp/chroma.cf.json", "public.trychroma.com", f"cloudformation/{version}/chroma.cf.json"
+    "/tmp/chroma.cf.json",
+    "public.trychroma.com",
+    f"cloudformation/{version}/chroma.cf.json",
 )
 
 # Upload to s3 under /latest version only if this is a release
 pattern = re.compile(r"^\d+\.\d+\.\d+$")
 if pattern.match(version):
     s3.upload_file(
-        "/tmp/chroma.cf.json", "public.trychroma.com", "cloudformation/latest/chroma.cf.json"
+        "/tmp/chroma.cf.json",
+        "public.trychroma.com",
+        "cloudformation/latest/chroma.cf.json",
     )
 else:
     print(f"Version {version} is not a 3-part semver, not uploading to /latest")
-
