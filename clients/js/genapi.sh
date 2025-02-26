@@ -1,6 +1,6 @@
 #!/usr/bin/env sh
 
-# curl -s http://localhost:8000/openapi.json | jq > openapi.json 
+# curl -s http://localhost:8000/openapi.json | jq > openapi.json
 curl -s http://localhost:8000/openapi.json | python -c "import sys, json; print(json.dumps(json.load(sys.stdin), indent=2))" > openapi.json
 
 if [[ "$OSTYPE" == "darwin"* ]]; then
@@ -22,5 +22,10 @@ if [[ "$OSTYPE" == "darwin"* ]]; then
 else
   sed -i -e '/import "whatwg-fetch";/d' -e 's/window.fetch/fetch/g' src/generated/runtime.ts
 fi
+
+# Add isomorphic-fetch dependency to runtime.ts
+echo "import 'isomorphic-fetch';" > temp.txt
+cat src/generated/runtime.ts >> temp.txt
+mv temp.txt src/generated/runtime.ts
 
 rm openapi.json
