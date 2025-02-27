@@ -1,85 +1,378 @@
-import chromadb.config
+from typing import Dict, Optional
 import logging
-from chromadb.telemetry.events import ClientStartEvent
-from chromadb.telemetry.posthog import Posthog
+from chromadb.api.client import Client as ClientCreator
+from chromadb.api.client import AdminClient as AdminClientCreator
+from chromadb.api.async_client import AsyncClient as AsyncClientCreator
+from chromadb.auth.token_authn import TokenTransportHeader
+import chromadb.config
+from chromadb.config import DEFAULT_DATABASE, DEFAULT_TENANT, Settings
+from chromadb.api import AdminAPI, AsyncClientAPI, ClientAPI
+from chromadb.api.models.Collection import Collection
+from chromadb.api.types import (
+    CollectionMetadata,
+    Documents,
+    EmbeddingFunction,
+    Embeddings,
+    URI,
+    URIs,
+    IDs,
+    Include,
+    Metadata,
+    Metadatas,
+    Where,
+    QueryResult,
+    GetResult,
+    WhereDocument,
+    UpdateCollectionMetadata,
+)
+
+# Re-export types from chromadb.types
+__all__ = [
+    "Collection",
+    "Metadata",
+    "Metadatas",
+    "Where",
+    "WhereDocument",
+    "Documents",
+    "IDs",
+    "URI",
+    "URIs",
+    "Embeddings",
+    "EmbeddingFunction",
+    "Include",
+    "CollectionMetadata",
+    "UpdateCollectionMetadata",
+    "QueryResult",
+    "GetResult",
+    "TokenTransportHeader",
+]
 
 logger = logging.getLogger(__name__)
 
-__settings = chromadb.config.Settings()
+__settings = Settings()
 
-__version__ = "0.3.21"
+__version__ = "0.6.3"
 
 
-def configure(**kwargs):
+# Workaround to deal with Colab's old sqlite3 version
+def is_in_colab() -> bool:
+    try:
+        import google.colab  # noqa: F401
+
+        return True
+    except ImportError:
+        return False
+
+
+IN_COLAB = is_in_colab()
+
+is_client = False
+try:
+    from chromadb.is_thin_client import is_thin_client
+
+    is_client = is_thin_client
+except ImportError:
+    is_client = False
+
+if not is_client:
+    import sqlite3
+
+    if sqlite3.sqlite_version_info < (3, 35, 0):
+        if IN_COLAB:
+            # In Colab, hotswap to pysqlite-binary if it's too old
+            import subprocess
+            import sys
+
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "pysqlite3-binary"]
+            )
+            __import__("pysqlite3")
+            sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+        else:
+            raise RuntimeError(
+                "\033[91mYour system has an unsupported version of sqlite3. Chroma \
+                    requires sqlite3 >= 3.35.0.\033[0m\n"
+                "\033[94mPlease visit \
+                    https://docs.trychroma.com/troubleshooting#sqlite to learn how \
+                    to upgrade.\033[0m"
+            )
+
+
+def configure(**kwargs) -> None:  # type: ignore
     """Override Chroma's default settings, environment variables or .env files"""
     global __settings
     __settings = chromadb.config.Settings(**kwargs)
 
 
-def get_settings():
+def get_settings() -> Settings:
     return __settings
 
 
-def get_db(settings=__settings):
-    """Return a chroma.DB instance based on the provided or environmental settings."""
+def EphemeralClient(
+    settings: Optional[Settings] = None,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> ClientAPI:
+    """
+    Creates an in-memory instance of Chroma. This is useful for testing and
+    development, but not recommended for production use.
 
-    setting = settings.chroma_db_impl.lower()
+    Args:
+        tenant: The tenant to use for this client. Defaults to the default tenant.
+        database: The database to use for this client. Defaults to the default database.
+    """
+    if settings is None:
+        settings = Settings()
+    settings.is_persistent = False
 
-    def require(key):
-        assert settings[key], f"Setting '{key}' is required when chroma_db_impl={setting}"
+    # Make sure paramaters are the correct types -- users can pass anything.
+    tenant = str(tenant)
+    database = str(database)
 
-    if setting == "clickhouse":
-        require("clickhouse_host")
-        require("clickhouse_port")
-        require("persist_directory")
-        logger.info("Using Clickhouse for database")
-        import chromadb.db.clickhouse
+    return ClientCreator(settings=settings, tenant=tenant, database=database)
 
-        return chromadb.db.clickhouse.Clickhouse(settings)
-    elif setting == "duckdb+parquet":
-        require("persist_directory")
-        logger.warning(
-            f"Using embedded DuckDB with persistence: data will be stored in: {settings.persist_directory}"
-        )
-        import chromadb.db.duckdb
 
-        return chromadb.db.duckdb.PersistentDuckDB(settings)
-    elif setting == "duckdb":
-        require("persist_directory")
-        logger.warning("Using embedded DuckDB without persistence: data will be transient")
-        import chromadb.db.duckdb
+def PersistentClient(
+    path: str = "./chroma",
+    settings: Optional[Settings] = None,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> ClientAPI:
+    """
+    Creates a persistent instance of Chroma that saves to disk. This is useful for
+    testing and development, but not recommended for production use.
 
-        return chromadb.db.duckdb.DuckDB(settings)
-    else:
+    Args:
+        path: The directory to save Chroma's data to. Defaults to "./chroma".
+        tenant: The tenant to use for this client. Defaults to the default tenant.
+        database: The database to use for this client. Defaults to the default database.
+    """
+    if settings is None:
+        settings = Settings()
+    settings.persist_directory = path
+    settings.is_persistent = True
+
+    # Make sure paramaters are the correct types -- users can pass anything.
+    tenant = str(tenant)
+    database = str(database)
+
+    return ClientCreator(tenant=tenant, database=database, settings=settings)
+
+
+def RustClient(
+    path: Optional[str] = None,
+    settings: Optional[Settings] = None,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> ClientAPI:
+    """
+    Creates an ephemeral or persistance instance of Chroma that saves to disk.
+    This is useful for testing and development, but not recommended for production use.
+
+    Args:
+        path: An optional directory to save Chroma's data to. The client is ephemeral if a None value is provided. Defaults to None.
+        tenant: The tenant to use for this client. Defaults to the default tenant.
+        database: The database to use for this client. Defaults to the default database.
+    """
+    if settings is None:
+        settings = Settings()
+
+    settings.chroma_api_impl = "chromadb.api.rust.RustBindingsAPI"
+    settings.is_persistent = path is not None
+    settings.persist_directory = path or ""
+
+    # Make sure paramaters are the correct types -- users can pass anything.
+    tenant = str(tenant)
+    database = str(database)
+
+    return ClientCreator(tenant=tenant, database=database, settings=settings)
+
+
+def HttpClient(
+    host: str = "localhost",
+    port: int = 8000,
+    ssl: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+    settings: Optional[Settings] = None,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> ClientAPI:
+    """
+    Creates a client that connects to a remote Chroma server. This supports
+    many clients connecting to the same server, and is the recommended way to
+    use Chroma in production.
+
+    Args:
+        host: The hostname of the Chroma server. Defaults to "localhost".
+        port: The port of the Chroma server. Defaults to "8000".
+        ssl: Whether to use SSL to connect to the Chroma server. Defaults to False.
+        headers: A dictionary of headers to send to the Chroma server. Defaults to {}.
+        settings: A dictionary of settings to communicate with the chroma server.
+        tenant: The tenant to use for this client. Defaults to the default tenant.
+        database: The database to use for this client. Defaults to the default database.
+    """
+
+    if settings is None:
+        settings = Settings()
+
+    # Make sure parameters are the correct types -- users can pass anything.
+    host = str(host)
+    port = int(port)
+    ssl = bool(ssl)
+    tenant = str(tenant)
+    database = str(database)
+
+    settings.chroma_api_impl = "chromadb.api.fastapi.FastAPI"
+    if settings.chroma_server_host and settings.chroma_server_host != host:
         raise ValueError(
-            f"Expected chroma_db_impl to be one of clickhouse, duckdb, duckdb+parquet, got {setting}"
+            f"Chroma server host provided in settings[{settings.chroma_server_host}] is different to the one provided in HttpClient: [{host}]"
         )
+    settings.chroma_server_host = host
+    if settings.chroma_server_http_port and settings.chroma_server_http_port != port:
+        raise ValueError(
+            f"Chroma server http port provided in settings[{settings.chroma_server_http_port}] is different to the one provided in HttpClient: [{port}]"
+        )
+    settings.chroma_server_http_port = port
+    settings.chroma_server_ssl_enabled = ssl
+    settings.chroma_server_headers = headers
+
+    return ClientCreator(tenant=tenant, database=database, settings=settings)
 
 
-def Client(settings=__settings):
-    """Return a chroma.API instance based on the provided or environmental
-    settings, optionally overriding the DB instance."""
+async def AsyncHttpClient(
+    host: str = "localhost",
+    port: int = 8000,
+    ssl: bool = False,
+    headers: Optional[Dict[str, str]] = None,
+    settings: Optional[Settings] = None,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> AsyncClientAPI:
+    """
+    Creates an async client that connects to a remote Chroma server. This supports
+    many clients connecting to the same server, and is the recommended way to
+    use Chroma in production.
 
-    setting = settings.chroma_api_impl.lower()
-    telemetry_client = Posthog(settings)
+    Args:
+        host: The hostname of the Chroma server. Defaults to "localhost".
+        port: The port of the Chroma server. Defaults to "8000".
+        ssl: Whether to use SSL to connect to the Chroma server. Defaults to False.
+        headers: A dictionary of headers to send to the Chroma server. Defaults to {}.
+        settings: A dictionary of settings to communicate with the chroma server.
+        tenant: The tenant to use for this client. Defaults to the default tenant.
+        database: The database to use for this client. Defaults to the default database.
+    """
 
-    # Submit event for client start
-    telemetry_client.capture(ClientStartEvent())
+    if settings is None:
+        settings = Settings()
 
-    def require(key):
-        assert settings[key], f"Setting '{key}' is required when chroma_api_impl={setting}"
+    # Make sure parameters are the correct types -- users can pass anything.
+    host = str(host)
+    port = int(port)
+    ssl = bool(ssl)
+    tenant = str(tenant)
+    database = str(database)
 
-    if setting == "rest":
-        require("chroma_server_host")
-        require("chroma_server_http_port")
-        logger.info("Running Chroma in client mode using REST to connect to remote server")
-        import chromadb.api.fastapi
+    settings.chroma_api_impl = "chromadb.api.async_fastapi.AsyncFastAPI"
+    if settings.chroma_server_host and settings.chroma_server_host != host:
+        raise ValueError(
+            f"Chroma server host provided in settings[{settings.chroma_server_host}] is different to the one provided in HttpClient: [{host}]"
+        )
+    settings.chroma_server_host = host
+    if settings.chroma_server_http_port and settings.chroma_server_http_port != port:
+        raise ValueError(
+            f"Chroma server http port provided in settings[{settings.chroma_server_http_port}] is different to the one provided in HttpClient: [{port}]"
+        )
+    settings.chroma_server_http_port = port
+    settings.chroma_server_ssl_enabled = ssl
+    settings.chroma_server_headers = headers
 
-        return chromadb.api.fastapi.FastAPI(settings, telemetry_client)
-    elif setting == "local":
-        logger.info("Running Chroma using direct local API.")
-        import chromadb.api.local
+    return await AsyncClientCreator.create(
+        tenant=tenant, database=database, settings=settings
+    )
 
-        return chromadb.api.local.LocalAPI(settings, get_db(settings), telemetry_client)
-    else:
-        raise ValueError(f"Expected chroma_api_impl to be one of rest, local, got {setting}")
+
+def CloudClient(
+    tenant: str,
+    database: str,
+    api_key: Optional[str] = None,
+    settings: Optional[Settings] = None,
+    *,  # Following arguments are keyword-only, intended for testing only.
+    cloud_host: str = "api.trychroma.com",
+    cloud_port: int = 8000,
+    enable_ssl: bool = True,
+) -> ClientAPI:
+    """
+    Creates a client to connect to a tennant and database on the Chroma cloud.
+
+    Args:
+        tenant: The tenant to use for this client.
+        database: The database to use for this client.
+        api_key: The api key to use for this client.
+    """
+
+    # If no API key is provided, try to load it from the environment variable
+    if api_key is None:
+        import os
+
+        api_key = os.environ.get("CHROMA_API_KEY")
+
+    # If the API key is still not provided, prompt the user
+    if api_key is None:
+        print(
+            "\033[93mDon't have an API key?\033[0m Get one at https://app.trychroma.com"
+        )
+        api_key = input("Please enter your Chroma API key: ")
+
+    if settings is None:
+        settings = Settings()
+
+    # Make sure paramaters are the correct types -- users can pass anything.
+    tenant = str(tenant)
+    database = str(database)
+    api_key = str(api_key)
+    cloud_host = str(cloud_host)
+    cloud_port = int(cloud_port)
+    enable_ssl = bool(enable_ssl)
+
+    settings.chroma_api_impl = "chromadb.api.fastapi.FastAPI"
+    settings.chroma_server_host = cloud_host
+    settings.chroma_server_http_port = cloud_port
+    # Always use SSL for cloud
+    settings.chroma_server_ssl_enabled = enable_ssl
+
+    settings.chroma_client_auth_provider = (
+        "chromadb.auth.token_authn.TokenAuthClientProvider"
+    )
+    settings.chroma_client_auth_credentials = api_key
+    settings.chroma_auth_token_transport_header = TokenTransportHeader.X_CHROMA_TOKEN
+
+    return ClientCreator(tenant=tenant, database=database, settings=settings)
+
+
+def Client(
+    settings: Settings = __settings,
+    tenant: str = DEFAULT_TENANT,
+    database: str = DEFAULT_DATABASE,
+) -> ClientAPI:
+    """
+    Return a running chroma.API instance
+
+    tenant: The tenant to use for this client. Defaults to the default tenant.
+    database: The database to use for this client. Defaults to the default database.
+    """
+
+    # Make sure paramaters are the correct types -- users can pass anything.
+    tenant = str(tenant)
+    database = str(database)
+
+    return ClientCreator(tenant=tenant, database=database, settings=settings)
+
+
+def AdminClient(settings: Settings = Settings()) -> AdminAPI:
+    """
+
+    Creates an admin client that can be used to create tenants and databases.
+
+    """
+    return AdminClientCreator(settings=settings)
