@@ -391,7 +391,7 @@ impl GrpcLog {
     }
 
     // ScoutLogs returns the offset of the next record to be inserted into the log.
-    #[tracing::instrument(skip(self), ret)]
+    #[tracing::instrument(skip(self))]
     pub(super) async fn scout_logs(
         &mut self,
         tenant: &str,
@@ -736,6 +736,18 @@ impl GrpcLog {
             Ok(())
         } else {
             Err(GrpcMigrateLogError::NotSupported)
+        }
+    }
+
+    /// If the log client is configured to use a memberlist-based client assigner,
+    /// this function checks if the client assigner is ready to serve requests.
+    /// This is useful to ensure that the client assigner has enough information about the cluster
+    /// before making requests to the log service.
+    pub fn is_ready(&self) -> bool {
+        if let Some(client_assigner) = &self.alt_client_assigner {
+            !client_assigner.is_empty()
+        } else {
+            true // If no client assigner is configured, we assume it's ready.
         }
     }
 }

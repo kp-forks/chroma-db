@@ -167,24 +167,30 @@ func (s *Server) GetCollections(ctx context.Context, req *coordinatorpb.GetColle
 
 	res := &coordinatorpb.GetCollectionsResponse{}
 
-	collectionIDs := []types.UniqueID{}
+	collectionIDs := ([]types.UniqueID)(nil)
 	parsedCollectionID, err := types.ToUniqueID(collectionID)
 	if err != nil {
 		log.Error("GetCollections failed. collection id format error", zap.Error(err), zap.Stringp("collection_id", collectionID), zap.Stringp("collection_name", collectionName))
 		return res, grpcutils.BuildInternalGrpcError(err.Error())
 	}
 	if parsedCollectionID != types.NilUniqueID() {
-		collectionIDs = append(collectionIDs, parsedCollectionID)
+		collectionIDs = []types.UniqueID{parsedCollectionID}
 	}
 
-	for _, id := range req.Ids {
-		parsedCollectionID, err := types.ToUniqueID(&id)
-		if err != nil {
-			log.Error("GetCollections failed. collection id format error", zap.Error(err), zap.Stringp("collection_id", &id), zap.Stringp("collection_name", collectionName))
-			return res, grpcutils.BuildInternalGrpcError(err.Error())
+	if req.IdsFilter != nil {
+		if collectionIDs == nil {
+			collectionIDs = make([]types.UniqueID, 0, len(req.IdsFilter.Ids))
 		}
-		if parsedCollectionID != types.NilUniqueID() {
-			collectionIDs = append(collectionIDs, parsedCollectionID)
+
+		for _, id := range req.IdsFilter.Ids {
+			parsedCollectionID, err := types.ToUniqueID(&id)
+			if err != nil {
+				log.Error("GetCollections failed. collection id format error", zap.Error(err), zap.Stringp("collection_id", &id), zap.Stringp("collection_name", collectionName))
+				return res, grpcutils.BuildInternalGrpcError(err.Error())
+			}
+			if parsedCollectionID != types.NilUniqueID() {
+				collectionIDs = append(collectionIDs, parsedCollectionID)
+			}
 		}
 	}
 
@@ -203,6 +209,23 @@ func (s *Server) GetCollections(ctx context.Context, req *coordinatorpb.GetColle
 		collectionpb := convertCollectionToProto(collection)
 		res.Collections = append(res.Collections, collectionpb)
 	}
+	return res, nil
+}
+
+func (s *Server) GetCollectionByResourceName(ctx context.Context, req *coordinatorpb.GetCollectionByResourceNameRequest) (*coordinatorpb.GetCollectionResponse, error) {
+	tenantResourceName := req.TenantResourceName
+	databaseName := req.Database
+	collectionName := req.Name
+
+	res := &coordinatorpb.GetCollectionResponse{}
+
+	collection, err := s.coordinator.GetCollectionByResourceName(ctx, tenantResourceName, databaseName, collectionName)
+	if err != nil {
+		log.Error("GetCollectionByResourceName failed. ", zap.Error(err), zap.String("tenant_resource_name", tenantResourceName), zap.String("database_name", databaseName), zap.String("collection_name", collectionName))
+		return res, grpcutils.BuildInternalGrpcError(err.Error())
+	}
+
+	res.Collection = convertCollectionToProto(collection)
 	return res, nil
 }
 

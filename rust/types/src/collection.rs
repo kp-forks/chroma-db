@@ -5,6 +5,7 @@ use crate::{
 };
 use chroma_error::{ChromaError, ErrorCodes};
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, SystemTime};
 use thiserror::Error;
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -32,6 +33,10 @@ pub struct CollectionUuid(pub Uuid);
 impl CollectionUuid {
     pub fn new() -> Self {
         CollectionUuid(Uuid::new_v4())
+    }
+
+    pub fn storage_prefix_for_log(&self) -> String {
+        format!("logs/{}", self)
     }
 }
 
@@ -100,6 +105,8 @@ pub struct Collection {
     pub root_collection_id: Option<CollectionUuid>,
     #[serde(skip)]
     pub lineage_file_path: Option<String>,
+    #[serde(skip, default = "SystemTime::now")]
+    pub updated_at: SystemTime,
 }
 
 impl Default for Collection {
@@ -120,6 +127,7 @@ impl Default for Collection {
             version_file_path: None,
             root_collection_id: None,
             lineage_file_path: None,
+            updated_at: SystemTime::now(),
         }
     }
 }
@@ -222,6 +230,14 @@ impl TryFrom<chroma_proto::Collection> for Collection {
             },
             None => None,
         };
+        // TODO(@codetheweb): this be updated to error with "missing field" once all SysDb deployments are up-to-date
+        let updated_at = match proto_collection.updated_at {
+            Some(updated_at) => {
+                SystemTime::UNIX_EPOCH
+                    + Duration::new(updated_at.seconds as u64, updated_at.nanos as u32)
+            }
+            None => SystemTime::now(),
+        };
         Ok(Collection {
             collection_id,
             name: proto_collection.name,
@@ -240,6 +256,7 @@ impl TryFrom<chroma_proto::Collection> for Collection {
                 .root_collection_id
                 .map(|uuid| CollectionUuid(Uuid::try_parse(&uuid).unwrap())),
             lineage_file_path: proto_collection.lineage_file_path,
+            updated_at,
         })
     }
 }
@@ -278,6 +295,7 @@ impl TryFrom<Collection> for chroma_proto::Collection {
             version_file_path: value.version_file_path,
             root_collection_id: value.root_collection_id.map(|uuid| uuid.0.to_string()),
             lineage_file_path: value.lineage_file_path,
+            updated_at: Some(value.updated_at.into()),
         })
     }
 }
@@ -326,6 +344,10 @@ mod test {
             version_file_path: Some("version_file_path".to_string()),
             root_collection_id: Some("00000000-0000-0000-0000-000000000000".to_string()),
             lineage_file_path: Some("lineage_file_path".to_string()),
+            updated_at: Some(prost_types::Timestamp {
+                seconds: 1,
+                nanos: 1,
+            }),
         };
         let converted_collection: Collection = proto_collection.try_into().unwrap();
         assert_eq!(
@@ -352,5 +374,18 @@ mod test {
             converted_collection.lineage_file_path,
             Some("lineage_file_path".to_string())
         );
+        assert_eq!(
+            converted_collection.updated_at,
+            SystemTime::UNIX_EPOCH + Duration::new(1, 1)
+        );
+    }
+
+    #[test]
+    fn storage_prefix_for_log_format() {
+        let collection_id = Uuid::parse_str("34e72052-5e60-47cb-be88-19a9715b7026")
+            .map(CollectionUuid)
+            .unwrap();
+        let prefix = collection_id.storage_prefix_for_log();
+        assert_eq!("logs/34e72052-5e60-47cb-be88-19a9715b7026", prefix);
     }
 }

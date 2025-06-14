@@ -2,6 +2,7 @@ use std::{path::Path, sync::Arc};
 
 mod ac;
 pub mod auth;
+pub mod base64_decode;
 pub mod config;
 #[allow(dead_code)]
 pub mod executor;
@@ -124,7 +125,7 @@ pub async fn frontend_service_entrypoint_with_config_system_registry(
         quota_enforcer,
         system,
     )
-    .run()
+    .run(None)
     .await;
 }
 
