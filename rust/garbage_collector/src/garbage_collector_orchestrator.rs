@@ -37,8 +37,6 @@
 //!    - Input: Version file, versions to delete, unused S3 files
 //!    - Output: Deletion confirmation
 
-use std::fmt::{Debug, Formatter};
-
 use crate::types::{CleanupMode, GarbageCollectorResponse};
 use async_trait::async_trait;
 use chroma_error::{ChromaError, ErrorCodes};
@@ -51,6 +49,8 @@ use chroma_system::{
 use chroma_types::chroma_proto::CollectionVersionFile;
 use chroma_types::CollectionUuid;
 use chrono::{DateTime, Utc};
+use std::fmt::{Debug, Formatter};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::oneshot::{error::RecvError, Sender};
 use tracing::Span;
@@ -87,7 +87,7 @@ pub struct GarbageCollectorOrchestrator {
     dispatcher: ComponentHandle<Dispatcher>,
     storage: Storage,
     result_channel: Option<Sender<Result<GarbageCollectorResponse, GarbageCollectorError>>>,
-    pending_version_file: Option<CollectionVersionFile>,
+    pending_version_file: Option<Arc<CollectionVersionFile>>,
     pending_versions_to_delete: Option<chroma_types::chroma_proto::VersionListForCollection>,
     pending_epoch_id: Option<i64>,
     num_versions_deleted: u32,
@@ -524,9 +524,8 @@ mod tests {
     use crate::helper::ChromaGrpcClients;
     use chroma_config::registry::Registry;
     use chroma_config::Configurable;
-    use chroma_storage::config::{
-        ObjectStoreBucketConfig, ObjectStoreConfig, ObjectStoreType, StorageConfig,
-    };
+    use chroma_storage::s3_config_for_localhost_with_bucket_name;
+    use chroma_storage::GetOptions;
     use chroma_sysdb::{GrpcSysDbConfig, SysDbConfig};
     use chroma_system::System;
     use std::str::FromStr;
@@ -751,7 +750,7 @@ mod tests {
 
     async fn get_hnsw_index_ids(storage: &Storage) -> Vec<Uuid> {
         storage
-            .list_prefix("hnsw")
+            .list_prefix("hnsw", GetOptions::default())
             .await
             .unwrap()
             .into_iter()
@@ -771,15 +770,7 @@ mod tests {
 
     async fn test_k8s_integration_check_end_to_end(use_spann: bool) {
         // Create storage config and storage client
-        let storage_config = StorageConfig::ObjectStore(ObjectStoreConfig {
-            bucket: ObjectStoreBucketConfig {
-                name: "chroma-storage".to_string(),
-                r#type: ObjectStoreType::Minio,
-            },
-            upload_part_size_bytes: 1024 * 1024,   // 1MB
-            download_part_size_bytes: 1024 * 1024, // 1MB
-            max_concurrent_requests: 10,
-        });
+        let storage_config = s3_config_for_localhost_with_bucket_name("chroma-storage").await;
 
         let registry = Registry::new();
         let storage = Storage::try_from_config(&storage_config, &registry)
@@ -919,15 +910,7 @@ mod tests {
     #[traced_test]
     async fn test_k8s_integration_soft_delete() {
         // Create storage config and storage client
-        let storage_config = StorageConfig::ObjectStore(ObjectStoreConfig {
-            bucket: ObjectStoreBucketConfig {
-                name: "chroma-storage".to_string(),
-                r#type: ObjectStoreType::Minio,
-            },
-            upload_part_size_bytes: 1024 * 1024,   // 1MB
-            download_part_size_bytes: 1024 * 1024, // 1MB
-            max_concurrent_requests: 10,
-        });
+        let storage_config = s3_config_for_localhost_with_bucket_name("chroma-storage").await;
 
         let registry = Registry::new();
         let storage = Storage::try_from_config(&storage_config, &registry)
@@ -935,7 +918,7 @@ mod tests {
             .unwrap();
 
         let deleted_hnsw_files_before_test: Vec<_> = storage
-            .list_prefix("gc")
+            .list_prefix("gc", GetOptions::default())
             .await
             .unwrap()
             .into_iter()
@@ -1060,7 +1043,7 @@ mod tests {
 
         // Verify that "deleted" files are renamed with the "gc" prefix
         let deleted_hnsw_files: Vec<_> = storage
-            .list_prefix("gc")
+            .list_prefix("gc", GetOptions::default())
             .await
             .unwrap()
             .into_iter()
@@ -1085,15 +1068,7 @@ mod tests {
     #[traced_test]
     async fn test_k8s_integration_dry_run() {
         // Create storage config and storage client
-        let storage_config = StorageConfig::ObjectStore(ObjectStoreConfig {
-            bucket: ObjectStoreBucketConfig {
-                name: "chroma-storage".to_string(),
-                r#type: ObjectStoreType::Minio,
-            },
-            upload_part_size_bytes: 1024 * 1024,   // 1MB
-            download_part_size_bytes: 1024 * 1024, // 1MB
-            max_concurrent_requests: 10,
-        });
+        let storage_config = s3_config_for_localhost_with_bucket_name("chroma-storage").await;
 
         let registry = Registry::new();
         let storage = Storage::try_from_config(&storage_config, &registry)

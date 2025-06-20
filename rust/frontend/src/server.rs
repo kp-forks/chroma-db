@@ -42,6 +42,10 @@ use uuid::Uuid;
 use crate::{
     ac::AdmissionControlledService,
     auth::{AuthenticateAndAuthorize, AuthzAction, AuthzResource},
+    base64_decode::{
+        maybe_decode_embeddings, maybe_decode_update_embeddings, EmbeddingsPayload,
+        UpdateEmbeddingsPayload,
+    },
     config::FrontendServerConfig,
     quota::{Action, QuotaEnforcer, QuotaPayload},
     server_middleware::{always_json_errors_middleware, default_json_content_type_middleware},
@@ -186,7 +190,8 @@ impl FrontendServer {
         }
     }
 
-    pub async fn run(self) {
+    /// Accepts an optional `ready_tx` channel that emits the bound port when the server is ready.
+    pub async fn run(self, ready_tx: Option<tokio::sync::oneshot::Sender<u16>>) {
         let system = self.system.clone();
 
         let FrontendServerConfig {
@@ -313,6 +318,15 @@ impl FrontendServer {
         let addr = format!("{}:{}", listen_address, port);
         println!("Listening on {addr}");
         let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let bound_port = listener
+            .local_addr()
+            .expect("Failed to get local address of server")
+            .port();
+        if let Some(ready_tx) = ready_tx {
+            ready_tx
+                .send(bound_port)
+                .expect("Failed to send bound port. Receiver has been dropped.");
+        }
         if circuit_breaker.enabled() {
             let service = AdmissionControlledService::new(circuit_breaker, app);
             axum::serve(listener, service.into_make_service())
@@ -432,6 +446,7 @@ async fn pre_flight_checks(
     server.metrics.pre_flight_checks.add(1, &[]);
     Ok(Json(ChecklistResponse {
         max_batch_size: server.frontend.clone().get_max_batch_size(),
+        supports_base64_encoding: true,
     }))
 }
 
@@ -1207,7 +1222,7 @@ async fn fork_collection(
 #[derive(Serialize, Deserialize, ToSchema, Debug, Clone)]
 pub struct AddCollectionRecordsPayload {
     ids: Vec<String>,
-    embeddings: Option<Vec<Vec<f32>>>,
+    embeddings: Option<EmbeddingsPayload>,
     documents: Option<Vec<Option<String>>>,
     uris: Option<Vec<Option<String>>>,
     metadatas: Option<Vec<Option<Metadata>>>,
@@ -1223,7 +1238,7 @@ impl AddCollectionRecordsPayload {
     ) -> Self {
         Self {
             ids,
-            embeddings,
+            embeddings: embeddings.map(EmbeddingsPayload::JsonArrays),
             documents,
             uris,
             metadatas,
@@ -1274,7 +1289,9 @@ async fn collection_add(
         .map(|val| val.to_string());
     let mut quota_payload = QuotaPayload::new(Action::Add, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
-    if let Some(embeddings) = &payload.embeddings {
+
+    let payload_embeddings: Option<Vec<Vec<f32>>> = maybe_decode_embeddings(payload.embeddings)?;
+    if let Some(embeddings) = payload_embeddings.as_ref() {
         quota_payload = quota_payload.with_add_embeddings(embeddings);
     }
     if let Some(metadatas) = &payload.metadatas {
@@ -1300,7 +1317,7 @@ async fn collection_add(
         database,
         collection_id,
         payload.ids,
-        payload.embeddings,
+        payload_embeddings,
         payload.documents,
         payload.uris,
         payload.metadatas,
@@ -1314,7 +1331,7 @@ async fn collection_add(
 #[derive(Deserialize, Debug, Clone, ToSchema, Serialize)]
 pub struct UpdateCollectionRecordsPayload {
     ids: Vec<String>,
-    embeddings: Option<Vec<Option<Vec<f32>>>>,
+    embeddings: Option<UpdateEmbeddingsPayload>,
     documents: Option<Vec<Option<String>>>,
     uris: Option<Vec<Option<String>>>,
     metadatas: Option<Vec<Option<UpdateMetadata>>>,
@@ -1363,7 +1380,9 @@ async fn collection_update(
         .map(|val| val.to_string());
     let mut quota_payload = QuotaPayload::new(Action::Update, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
-    if let Some(embeddings) = &payload.embeddings {
+    let payload_embeddings: Option<Vec<Option<Vec<f32>>>> =
+        maybe_decode_update_embeddings(payload.embeddings)?;
+    if let Some(embeddings) = &payload_embeddings {
         quota_payload = quota_payload.with_update_embeddings(embeddings);
     }
     if let Some(metadatas) = &payload.metadatas {
@@ -1388,7 +1407,7 @@ async fn collection_update(
         database,
         collection_id,
         payload.ids,
-        payload.embeddings,
+        payload_embeddings,
         payload.documents,
         payload.uris,
         payload.metadatas,
@@ -1400,7 +1419,7 @@ async fn collection_update(
 #[derive(Deserialize, Debug, Clone, ToSchema, Serialize)]
 pub struct UpsertCollectionRecordsPayload {
     ids: Vec<String>,
-    embeddings: Option<Vec<Vec<f32>>>,
+    embeddings: Option<EmbeddingsPayload>,
     documents: Option<Vec<Option<String>>>,
     uris: Option<Vec<Option<String>>>,
     metadatas: Option<Vec<Option<UpdateMetadata>>>,
@@ -1456,7 +1475,8 @@ async fn collection_upsert(
         .map(|val| val.to_string());
     let mut quota_payload = QuotaPayload::new(Action::Upsert, tenant.clone(), api_token);
     quota_payload = quota_payload.with_ids(&payload.ids);
-    if let Some(embeddings) = &payload.embeddings {
+    let payload_embeddings: Option<Vec<Vec<f32>>> = maybe_decode_embeddings(payload.embeddings)?;
+    if let Some(embeddings) = payload_embeddings.as_ref() {
         quota_payload = quota_payload.with_add_embeddings(embeddings);
     }
     if let Some(metadatas) = &payload.metadatas {
@@ -1482,7 +1502,7 @@ async fn collection_upsert(
         database,
         collection_id,
         payload.ids,
-        payload.embeddings,
+        payload_embeddings,
         payload.documents,
         payload.uris,
         payload.metadatas,
@@ -1906,14 +1926,12 @@ mod tests {
     use chroma_system::System;
     use std::sync::Arc;
 
-    async fn test_server() -> u16 {
+    async fn test_server(mut config: FrontendServerConfig) -> u16 {
         let registry = Registry::new();
         let system = System::new();
 
-        let port = random_port::PortPicker::new().random(true).pick().unwrap();
-
-        let mut config = FrontendServerConfig::single_node_default();
-        config.port = port;
+        // Binding to port 0 will let the OS choose an available port. This avoids port conflicts when running tests in parallel.
+        config.port = 0;
 
         let frontend = Frontend::try_from_config(&(config.clone().frontend, system), &registry)
             .await
@@ -1926,38 +1944,23 @@ mod tests {
             Arc::new(()),
             System::new(),
         );
+
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+
         tokio::task::spawn(async move {
-            app.run().await;
+            app.run(Some(ready_tx)).await;
         });
 
-        port
+        // Wait for port
+        ready_rx.await.unwrap()
     }
 
     #[tokio::test]
     async fn test_cors() {
-        let registry = Registry::new();
-        let system = System::new();
-
-        let port = random_port::PortPicker::new().pick().unwrap();
-
         let mut config = FrontendServerConfig::single_node_default();
-        config.port = port;
-        config.cors_allow_origins = Some(vec!["http://localhost:3000".to_string()]);
+        config.cors_allow_origins = Some(vec!["http://localhost:8000".to_string()]);
 
-        let frontend = Frontend::try_from_config(&(config.clone().frontend, system), &registry)
-            .await
-            .unwrap();
-        let app = FrontendServer::new(
-            config,
-            frontend,
-            vec![],
-            Arc::new(()),
-            Arc::new(()),
-            System::new(),
-        );
-        tokio::task::spawn(async move {
-            app.run().await;
-        });
+        let port = test_server(config).await;
 
         let client = reqwest::Client::new();
         let res = client
@@ -1965,14 +1968,14 @@ mod tests {
                 reqwest::Method::OPTIONS,
                 format!("http://localhost:{}/api/v2/heartbeat", port),
             )
-            .header("Origin", "http://localhost:3000")
+            .header("Origin", "http://localhost:8000")
             .send()
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
 
         let allow_origin = res.headers().get("Access-Control-Allow-Origin");
-        assert_eq!(allow_origin.unwrap(), "http://localhost:3000");
+        assert_eq!(allow_origin.unwrap(), "http://localhost:8000");
 
         let allow_methods = res.headers().get("Access-Control-Allow-Methods");
         assert_eq!(allow_methods.unwrap(), "*");
@@ -1983,29 +1986,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_cors_wildcard() {
-        let registry = Registry::new();
-        let system = System::new();
-
-        let port = random_port::PortPicker::new().pick().unwrap();
-
         let mut config = FrontendServerConfig::single_node_default();
-        config.port = port;
         config.cors_allow_origins = Some(vec!["*".to_string()]);
 
-        let frontend = Frontend::try_from_config(&(config.clone().frontend, system), &registry)
-            .await
-            .unwrap();
-        let app = FrontendServer::new(
-            config,
-            frontend,
-            vec![],
-            Arc::new(()),
-            Arc::new(()),
-            System::new(),
-        );
-        tokio::task::spawn(async move {
-            app.run().await;
-        });
+        let port = test_server(config).await;
 
         let client = reqwest::Client::new();
         let res = client
@@ -2013,7 +1997,7 @@ mod tests {
                 reqwest::Method::OPTIONS,
                 format!("http://localhost:{}/api/v2/heartbeat", port),
             )
-            .header("Origin", "http://localhost:3000")
+            .header("Origin", "http://localhost:8000")
             .send()
             .await
             .unwrap();
@@ -2031,7 +2015,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_defaults_to_json_content_type() {
-        let port = test_server().await;
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
 
         // We don't send a content-type header
         let client = reqwest::Client::new();
@@ -2047,7 +2031,7 @@ mod tests {
     #[tokio::test]
     async fn test_plaintext_error_conversion() {
         // By default, axum returns plaintext errors for some errors. This asserts that there's middleware to ensure all errors are returned as JSON.
-        let port = test_server().await;
+        let port = test_server(FrontendServerConfig::single_node_default()).await;
 
         let client = reqwest::Client::new();
         let res = client

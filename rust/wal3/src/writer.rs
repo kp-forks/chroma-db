@@ -1,10 +1,11 @@
+use std::future::Future;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use arrow::array::{ArrayRef, BinaryArray, RecordBatch, UInt64Array};
 use chroma_storage::admissioncontrolleds3::StorageRequestPriority;
-use chroma_storage::{GetOptions, PutOptions, Storage, StorageError};
+use chroma_storage::{DeleteOptions, ETag, GetOptions, PutOptions, Storage, StorageError};
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
@@ -13,18 +14,18 @@ use tracing::Instrument;
 
 use crate::{
     unprefixed_fragment_path, BatchManager, CursorStore, CursorStoreOptions, Error,
-    ExponentialBackoff, Fragment, FragmentSeqNo, LogPosition, LogReader, LogReaderOptions,
-    LogWriterOptions, Manifest, ManifestManager, ThrottleOptions,
+    ExponentialBackoff, Fragment, FragmentSeqNo, Garbage, GarbageCollectionOptions, LogPosition,
+    LogReader, LogReaderOptions, LogWriterOptions, Manifest, ManifestManager, ThrottleOptions,
 };
 
 /// The epoch writer is a counting writer.  Every epoch exists.  An epoch goes
 /// unused->used->discarded.  The epoch of a writer is used to determine if and when log contention
 /// indicates that a new writer should be created.  The epoch is incremented when a new writer is
 /// created and checked before creating a new writer.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct EpochWriter {
     epoch: u64,
-    writer: Arc<OnceLogWriter>,
+    writer: Option<Arc<OnceLogWriter>>,
 }
 
 ///////////////////////////////////////////// MarkDirty ////////////////////////////////////////////
@@ -44,9 +45,13 @@ impl MarkDirty for () {
 ///////////////////////////////////////////// LogWriter ////////////////////////////////////////////
 
 pub struct LogWriter {
+    options: LogWriterOptions,
+    storage: Arc<Storage>,
+    prefix: String,
     writer: String,
     mark_dirty: Arc<dyn MarkDirty>,
-    inner: Mutex<Option<EpochWriter>>,
+    inner: Mutex<EpochWriter>,
+    reopen_protection: tokio::sync::Mutex<()>,
 }
 
 impl LogWriter {
@@ -68,24 +73,21 @@ impl LogWriter {
         mark_dirty: D,
     ) -> Result<Self, Error> {
         let mark_dirty = Arc::new(mark_dirty) as _;
-        let once_log_writer = OnceLogWriter::open(
+        let inner = EpochWriter::default();
+        let prefix = prefix.to_string();
+        let writer = writer.to_string();
+        let reopen_protection = tokio::sync::Mutex::new(());
+        let this = Self {
             options,
             storage,
-            prefix.to_string(),
-            writer.to_string(),
-            Arc::clone(&mark_dirty),
-        )
-        .await?;
-        let inner = EpochWriter {
-            epoch: 1,
-            writer: once_log_writer,
-        };
-        let writer = writer.to_string();
-        Ok(Self {
+            prefix,
             writer,
             mark_dirty,
-            inner: Mutex::new(Some(inner)),
-        })
+            inner: Mutex::new(inner),
+            reopen_protection,
+        };
+        this.ensure_open().await?;
+        Ok(this)
     }
 
     /// Open or try once to initialize the log.
@@ -97,39 +99,30 @@ impl LogWriter {
         mark_dirty: D,
     ) -> Result<Self, Error> {
         let mark_dirty = Arc::new(mark_dirty) as _;
-        let once_log_writer = match OnceLogWriter::open(
-            options.clone(),
-            Arc::clone(&storage),
-            prefix.to_string(),
-            writer.to_string(),
-            Arc::clone(&mark_dirty),
-        )
-        .await
-        {
-            Ok(writer) => writer,
-            Err(Error::UninitializedLog) => {
-                Self::initialize(&options, &storage, prefix, writer).await?;
-                OnceLogWriter::open(
-                    options,
-                    storage,
-                    prefix.to_string(),
-                    writer.to_string(),
-                    Arc::clone(&mark_dirty),
-                )
-                .await?
-            }
-            Err(e) => return Err(e),
-        };
-        let inner = EpochWriter {
-            epoch: 1,
-            writer: once_log_writer,
-        };
+        let inner = EpochWriter::default();
+        let prefix = prefix.to_string();
         let writer = writer.to_string();
-        Ok(Self {
+        let reopen_protection = tokio::sync::Mutex::new(());
+        let this = Self {
+            options,
+            storage,
+            prefix,
             writer,
             mark_dirty,
-            inner: Mutex::new(Some(inner)),
-        })
+            inner: Mutex::new(inner),
+            reopen_protection,
+        };
+        match this.ensure_open().await {
+            Ok(_) => {}
+            Err(Error::UninitializedLog) => {
+                Self::initialize(&this.options, &this.storage, &this.prefix, &this.writer).await?;
+                this.ensure_open().await?;
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        }
+        Ok(this)
     }
 
     /// Given a contiguous subset of data from some other location (preferably another log),
@@ -159,7 +152,7 @@ impl LogWriter {
         // race between writers.
         let manifest = Manifest::load(&ThrottleOptions::default(), storage, prefix).await?;
         if manifest.is_some() {
-            return Err(Error::LogContention);
+            return Err(Error::LogContentionFailure);
         }
         // SAFETY(rescrv):  This will only succeed if the file doesn't exist.  Technically the log
         // could be initialized and garbage collected to leave a prefix hole, but our timing
@@ -235,9 +228,9 @@ impl LogWriter {
     /// This will close the log.
     pub async fn close(self) -> Result<(), Error> {
         // SAFETY(rescrv):  Mutex poisoning.
-        let inner = { self.inner.lock().unwrap().take() };
-        if let Some(inner) = inner {
-            inner.writer.close().await
+        let writer = { self.inner.lock().unwrap().writer.take() };
+        if let Some(writer) = writer {
+            writer.close().await
         } else {
             Ok(())
         }
@@ -250,79 +243,129 @@ impl LogWriter {
 
     #[tracing::instrument(skip(self, messages))]
     pub async fn append_many(&self, messages: Vec<Vec<u8>>) -> Result<LogPosition, Error> {
-        // SAFETY(rescrv):  Mutex poisoning.
-        let inner = { self.inner.lock().unwrap().clone() };
-        if let Some(epoch_writer) = inner {
-            let res = epoch_writer.writer.append(messages.clone()).await;
-            if matches!(res, Err(Error::LogContention)) {
-                loop {
-                    let writer = OnceLogWriter::open(
-                        epoch_writer.writer.options.clone(),
-                        epoch_writer.writer.storage.clone(),
-                        epoch_writer.writer.prefix.clone(),
-                        self.writer.clone(),
-                        Arc::clone(&self.mark_dirty),
-                    )
-                    .await;
-                    let writer = match writer {
-                        Ok(writer) => writer,
-                        Err(Error::LogContention) => continue,
-                        Err(err) => return Err(err),
-                    };
-                    // SAFETY(rescrv):  Mutex poisoning.
-                    let mut inner = self.inner.lock().unwrap();
-                    if let Some(second) = inner.as_mut() {
-                        if second.epoch == epoch_writer.epoch {
-                            second.epoch += 1;
-                            second.writer.shutdown();
-                            second.writer = writer;
-                        }
-                        return Err(Error::LogContention);
-                    } else {
-                        // This should never happen, so just be polite with an error.
-                        return Err(Error::LogClosed);
-                    }
-                }
-            } else {
-                res
-            }
-        } else {
-            // This should never happen, so just be polite with an error.
-            Err(Error::LogClosed)
-        }
+        let once_log_append_many = move |log: &Arc<OnceLogWriter>| {
+            let messages = messages.clone();
+            let log = Arc::clone(log);
+            async move { log.append(messages).await }
+        };
+        self.handle_log_contention(once_log_append_many).await
     }
 
+    // TODO(rescrv):  No option
     pub fn reader(&self, options: LogReaderOptions) -> Option<LogReader> {
-        // SAFETY(rescrv):  Mutex poisoning.
-        let inner = self.inner.lock().unwrap();
-        inner.as_ref().map(|inner| {
-            LogReader::new(
-                options,
-                Arc::clone(&inner.writer.storage),
-                inner.writer.prefix.clone(),
-            )
-        })
+        Some(LogReader::new(
+            options,
+            Arc::clone(&self.storage),
+            self.prefix.clone(),
+        ))
     }
 
+    // TODO(rescrv):  No option
     pub fn cursors(&self, options: CursorStoreOptions) -> Option<CursorStore> {
-        // SAFETY(rescrv):  Mutex poisoning.
-        let inner = self.inner.lock().unwrap();
-        inner.as_ref().map(|inner| {
-            CursorStore::new(
-                options,
-                Arc::clone(&inner.writer.storage),
-                inner.writer.prefix.clone(),
-                self.writer.clone(),
-            )
-        })
+        Some(CursorStore::new(
+            options,
+            Arc::clone(&self.storage),
+            self.prefix.clone(),
+            self.writer.clone(),
+        ))
     }
 
     pub fn manifest(&self) -> Option<Manifest> {
         // SAFETY(rescrv):  Mutex poisoning.
         let inner = self.inner.lock().unwrap();
         inner
+            .writer
             .as_ref()
-            .map(|inner| inner.writer.manifest_manager.latest())
+            .map(|writer| writer.manifest_manager.latest())
+    }
+
+    pub async fn garbage_collect(&self, options: &GarbageCollectionOptions) -> Result<(), Error> {
+        let once_log_garbage_collect = move |log: &Arc<OnceLogWriter>| {
+            let options = options.clone();
+            let log = Arc::clone(log);
+            async move { log.garbage_collect(&options).await }
+        };
+        self.handle_log_contention(once_log_garbage_collect).await
+    }
+
+    async fn handle_log_contention<O, F: Future<Output = Result<O, Error>>>(
+        &self,
+        f: impl Fn(&Arc<OnceLogWriter>) -> F,
+    ) -> Result<O, Error> {
+        for _ in 0..3 {
+            let writer = self.ensure_open().await?;
+            match f(&writer).await {
+                Ok(out) => {
+                    return Ok(out);
+                }
+                Err(Error::LogContentionDurable) => {
+                    {
+                        // SAFETY(rescrv):  Mutex poisoning.
+                        let mut inner = self.inner.lock().unwrap();
+                        inner.writer.take();
+                    }
+                    // Silence this error in favor of the one we got from f.
+                    if self.ensure_open().await.is_ok() {
+                        return Err(Error::LogContentionDurable);
+                    } else {
+                        return Err(Error::LogContentionFailure);
+                    }
+                }
+                Err(Error::LogContentionFailure) => {
+                    // SAFETY(rescrv):  Mutex poisoning.
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.writer.take();
+                    return Err(Error::LogContentionFailure);
+                }
+                Err(Error::LogContentionRetry) => {
+                    // SAFETY(rescrv):  Mutex poisoning.
+                    let mut inner = self.inner.lock().unwrap();
+                    inner.writer.take();
+                }
+                Err(err) => {
+                    return Err(err);
+                }
+            }
+        }
+        Err(Error::LogContentionFailure)
+    }
+
+    async fn ensure_open(&self) -> Result<Arc<OnceLogWriter>, Error> {
+        let _guard = self.reopen_protection.lock().await;
+        for _ in 0..3 {
+            let epoch = {
+                // SAFETY(rescrv):  Mutex poisoning.
+                let inner = self.inner.lock().unwrap();
+                if let Some(writer) = inner.writer.as_ref() {
+                    return Ok(Arc::clone(writer));
+                }
+                inner.epoch
+            };
+            let writer = match OnceLogWriter::open(
+                self.options.clone(),
+                self.storage.clone(),
+                self.prefix.clone(),
+                self.writer.clone(),
+                Arc::clone(&self.mark_dirty),
+            )
+            .await
+            {
+                Ok(writer) => writer,
+                Err(Error::LogContentionRetry) => continue,
+                Err(err) => return Err(err),
+            };
+            // SAFETY(rescrv):  Mutex poisoning.
+            let mut inner = self.inner.lock().unwrap();
+            if inner.epoch == epoch {
+                inner.epoch += 1;
+                if let Some(writer) = inner.writer.take() {
+                    writer.shutdown();
+                }
+                inner.writer = Some(Arc::clone(&writer));
+                return Ok(writer);
+            }
+        }
+        Err(Error::LogContentionRetry)
     }
 }
 
@@ -372,7 +415,7 @@ impl OnceLogWriter {
     ) -> Result<Arc<Self>, Error> {
         let done = AtomicBool::new(false);
         let batch_manager = BatchManager::new(options.throttle_fragment).ok_or(Error::Internal)?;
-        let manifest_manager = ManifestManager::new(
+        let mut manifest_manager = ManifestManager::new(
             options.throttle_manifest,
             options.snapshot_manifest,
             Arc::clone(&storage),
@@ -518,9 +561,7 @@ impl OnceLogWriter {
             log_position,
             messages,
         );
-        let fut2 = self
-            .mark_dirty
-            .mark_dirty(log_position + messages_len, messages_len);
+        let fut2 = self.mark_dirty.mark_dirty(log_position, messages_len);
         let (res1, res2) = futures::future::join(fut1, fut2).await;
         res2?;
         let (path, setsum, num_bytes) = res1?;
@@ -537,6 +578,141 @@ impl OnceLogWriter {
         // Record the records/batches written.
         self.batch_manager.finish_write();
         Ok(log_position)
+    }
+
+    #[tracing::instrument(skip(self))]
+    async fn garbage_collect(&self, options: &GarbageCollectionOptions) -> Result<(), Error> {
+        self.garbage_collect_recursive(options, false, None).await
+    }
+
+    async fn garbage_collect_recursive(
+        &self,
+        options: &GarbageCollectionOptions,
+        base: bool,
+        existing: Option<&ETag>,
+    ) -> Result<(), Error> {
+        let cutoff = self.garbage_collection_cutoff().await?;
+        self.manifest_manager.heartbeat().await?;
+        let garbage = self
+            .manifest_manager
+            // TODO(rescrv):  Evaluate putting a cache in here.
+            .compute_garbage(options, cutoff, &())
+            .await?;
+        let (garbage, e_tag) = match garbage
+            .install(
+                &self.options.throttle_manifest,
+                &self.storage,
+                &self.prefix,
+                existing,
+            )
+            .await
+        {
+            Ok(e_tag) => (garbage, e_tag),
+            Err(Error::LogContentionFailure)
+            | Err(Error::LogContentionRetry)
+            | Err(Error::LogContentionDurable) => {
+                match Garbage::load(&self.options.throttle_manifest, &self.storage, &self.prefix)
+                    .await
+                {
+                    Ok(Some((garbage, e_tag))) => {
+                        if garbage.is_empty() {
+                            if base {
+                                return Err(Error::LogContentionRetry);
+                            } else {
+                                return Box::pin(self.garbage_collect_recursive(
+                                    options,
+                                    true,
+                                    e_tag.as_ref(),
+                                ))
+                                .await;
+                            }
+                        } else {
+                            (garbage, e_tag)
+                        }
+                    }
+                    Ok(None) => {
+                        return Err(Error::LogContentionFailure);
+                    }
+                    Err(err) => {
+                        return Err(err);
+                    }
+                }
+            }
+            Err(err) => {
+                return Err(err);
+            }
+        };
+        let Some(e_tag) = e_tag else {
+            return Err(Error::GarbageCollection(
+                "installed garbage without an ETag".to_string(),
+            ));
+        };
+        let paths = garbage
+            .prefixed_paths_to_delete(&self.prefix)
+            .collect::<Vec<_>>();
+        self.manifest_manager.apply_garbage(garbage.clone()).await?;
+        let exp_backoff: ExponentialBackoff = options.throttle.into();
+        let start = Instant::now();
+        for path in paths {
+            loop {
+                match self.storage.delete(&path, DeleteOptions::default()).await {
+                    Ok(()) => break,
+                    Err(StorageError::NotFound { .. }) => break,
+                    Err(err) => {
+                        tracing::error!("could not cleanup garbage: {err:?}");
+                        if start.elapsed() > Duration::from_secs(600) {
+                            tracing::error!(
+                                "could not cleanup garbage within 10 minutes, returning"
+                            );
+                            return Err(Error::StorageError(Arc::new(err)));
+                        }
+                        let mut backoff = exp_backoff.next();
+                        if backoff > Duration::from_secs(600) {
+                            backoff = Duration::from_secs(600);
+                        }
+                        tokio::time::sleep(backoff).await;
+                    }
+                }
+            }
+        }
+        garbage
+            .reset(
+                &self.options.throttle_manifest,
+                &self.storage,
+                &self.prefix,
+                &e_tag,
+            )
+            .await?;
+        Ok(())
+    }
+
+    // NOTE(rescrv): Garbage collection cutoff is responsible for determining the crucial amount of
+    // how much to garbage collect.  If there are no cursors, it must bail with an error.
+    async fn garbage_collection_cutoff(&self) -> Result<LogPosition, Error> {
+        let cursors = CursorStore::new(
+            CursorStoreOptions::default(),
+            Arc::clone(&self.storage),
+            self.prefix.clone(),
+            "garbage collection writer".to_string(),
+        );
+        // This will be None if there are no cursors, upholding the function invariant.
+        let mut collect_up_to = None;
+        for cursor_name in cursors.list().await? {
+            let witness = cursors.load(&cursor_name).await?;
+            let Some(cursor) = witness.map(|w| w.1) else {
+                return Err(Error::LogContentionFailure);
+            };
+            if cursor.position <= collect_up_to.unwrap_or(cursor.position) {
+                collect_up_to = Some(cursor.position);
+            }
+        }
+        let Some(collect_up_to) = collect_up_to else {
+            return Err(Error::NoSuchCursor(format!(
+                "there is no cursor for prefix {}",
+                self.prefix
+            )));
+        };
+        Ok(collect_up_to)
     }
 }
 
@@ -623,7 +799,7 @@ pub async fn upload_parquet(
                 return Ok((unprefixed_path, setsum, buffer.len()));
             }
             Err(StorageError::Precondition { path: _, source: _ }) => {
-                return Err(Error::LogContention);
+                return Err(Error::LogContentionFailure);
             }
             Err(err) => {
                 if start.elapsed() > Duration::from_secs(60) {

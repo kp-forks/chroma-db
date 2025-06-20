@@ -34,6 +34,7 @@ jobs:
             # Outside docs
             outside-docs:
               - '!docs/**'
+              - '!**/*.md'
             # Helm chart changes
             helm-changes:
               - 'k8s/distributed-chroma/**'
@@ -106,7 +107,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: useblacksmith/setup-node@v5
+      - uses: actions/setup-node@v4
         with:
           node-version: "18.x"
           registry-url: "https://registry.npmjs.org"

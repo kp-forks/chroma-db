@@ -20,9 +20,9 @@ use chroma_types::{
 };
 use chroma_types::{
     BatchGetCollectionSoftDeleteStatusError, BatchGetCollectionVersionFilePathsError, Collection,
-    CollectionConversionError, CollectionUuid, CountForksError, FinishDatabaseDeletionError,
-    FlushCompactionResponse, FlushCompactionResponseConversionError, ForkCollectionError, Segment,
-    SegmentConversionError, SegmentScope, Tenant,
+    CollectionConversionError, CollectionUuid, CountForksError, DatabaseUuid,
+    FinishDatabaseDeletionError, FlushCompactionResponse, FlushCompactionResponseConversionError,
+    ForkCollectionError, Segment, SegmentConversionError, SegmentScope, Tenant,
 };
 use std::collections::HashMap;
 use std::fmt::Debug;
@@ -265,6 +265,8 @@ impl SysDb {
                     version_file_path: None,
                     root_collection_id: None,
                     lineage_file_path: None,
+                    updated_at: SystemTime::now(),
+                    database_id: DatabaseUuid::new(),
                 };
 
                 test_sysdb.add_collection(collection.clone());
@@ -847,9 +849,10 @@ impl GrpcSysDb {
             .client
             .get_collections(chroma_proto::GetCollectionsRequest {
                 id: collection_id_str,
-                ids: collection_ids
-                    .map(|ids| ids.into_iter().map(|id| id.0.to_string()).collect())
-                    .unwrap_or_default(),
+                ids_filter: collection_ids.map(|ids| {
+                    let ids = ids.into_iter().map(|id| id.0.to_string()).collect();
+                    chroma_proto::CollectionIdsFilter { ids }
+                }),
                 name,
                 include_soft_deleted: Some(include_soft_deleted),
                 limit: limit.map(|l| l as i32),

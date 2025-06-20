@@ -62,7 +62,20 @@ let collection = await client.createCollection({
 });
 ```
 
-The embedding function takes text as input and embeds it. If no embedding function is supplied, Chroma will use [sentence transformer](https://www.sbert.net/index.html) as a default. You can learn more about [embedding functions](../embeddings/embedding-functions), and how to create your own.
+The embedding function takes text as input and embeds it. Different embedding functions are available on npm under the `@chroma-core` organization. For example, if you want to use the `OpenAIEmbeddingFunction`, install `@chroma-core/openai`:
+
+```typescript
+import { OpenAIEmbeddingFunction } from "@chroma-core/openai";
+
+let collection = await client.createCollection({
+    name: "my_collection",
+    embeddingFunction: new OpenAIEmbeddingFunction(),
+});
+```
+
+If no embedding function is supplied, Chroma will use [sentence transformer](https://www.sbert.net/index.html) as a default. Make sure the `@chroma-core/default-embed` package is installed. 
+
+You can learn more about [embedding functions](../embeddings/embedding-functions), and how to create your own.
 
 When creating collections, you can pass the optional `metadata` argument to add a mapping of metadata key-value pairs to your collections. This can be useful for adding general about the collection like creation time, description of the data stored in the collection, and more.
 
@@ -107,12 +120,6 @@ const [col1, col2] = client.getCollections([
     { name: 'col1', embeddingFunction: openaiEF },
     { name: 'col2', embeddingFunction: defaultEF },
 ])
-```
-
-The `getCollection` and `getCollections` methods issue an API call to a Chroma server to get collections with all their fields. If you only need access to collection actions on records, and want to save the API call, you can get a "thin" collection object using the `getCollectionById` method (and `getCollectionsById`). It takes in a collection **ID** and an embedding function.
-
-```typescript
-const collection = client.getCollectionById({ id: 'abc', embeddingFunction: openaiEF })
 ```
 
 You can also delete collections by name using `deleteCollection`:
